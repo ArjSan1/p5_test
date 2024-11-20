@@ -1,5 +1,9 @@
+#ifndef _USER_H_
+#define _USER_H_
+
 struct stat;
 struct rtcdate;
+#include "wmap.h"
 
 // system calls
 int fork(void);
@@ -23,6 +27,10 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+int wmap(uint addr, int length, int flags, int fd);
+int wunmap(uint addr);
+int va2pa(uint va);
+int getwmapinfo(struct wmapinfo *wminfo);
 
 // ulib.c
 int stat(const char*, struct stat*);
@@ -37,3 +45,5 @@ void* memset(void*, int, uint);
 void* malloc(uint);
 void free(void*);
 int atoi(const char*);
+
+#endif // _USER_H_

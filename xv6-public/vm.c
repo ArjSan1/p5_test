@@ -5,10 +5,16 @@
 #include "memlayout.h"
 #include "mmu.h"
 #include "proc.h"
+#include "fs.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "file.h"
 #include "elf.h"
 
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
+#define min(a, b) ((a) < (b) ? (a) : (b))
+
 
 // Set up CPU's kernel segment descriptors.
 // Run once on entry on each CPU.
@@ -32,7 +38,7 @@ seginit(void)
 // Return the address of the PTE in page table pgdir
 // that corresponds to virtual address va.  If alloc!=0,
 // create any required page table pages.
-static pte_t *
+pte_t *
 walkpgdir(pde_t *pgdir, const void *va, int alloc)
 {
   pde_t *pde;
@@ -57,7 +63,7 @@ walkpgdir(pde_t *pgdir, const void *va, int alloc)
 // Create PTEs for virtual addresses starting at va that refer to
 // physical addresses starting at pa. va and size might not
 // be page-aligned.
-static int
+int
 mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
 {
   char *a, *last;
@@ -195,25 +201,36 @@ inituvm(pde_t *pgdir, char *init, uint sz)
 // Load a program segment into pgdir.  addr must be page-aligned
 // and the pages from addr to addr+sz must already be mapped.
 int
-loaduvm(pde_t *pgdir, char *addr, struct inode *ip, uint offset, uint sz)
+loaduvm(pde_t *pgdir, char *addr, struct inode *ip, uint offset, uint sz, int flags)
 {
-  uint i, pa, n;
-  pte_t *pte;
+    uint i, pa, n;
+    pte_t *pte;
 
-  if((uint) addr % PGSIZE != 0)
-    panic("loaduvm: addr must be page aligned");
-  for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walkpgdir(pgdir, addr+i, 0)) == 0)
-      panic("loaduvm: address should exist");
-    pa = PTE_ADDR(*pte);
-    if(sz - i < PGSIZE)
-      n = sz - i;
-    else
-      n = PGSIZE;
-    if(readi(ip, P2V(pa), offset+i, n) != n)
-      return -1;
-  }
-  return 0;
+    for (i = 0; i < sz; i += PGSIZE) {
+        uint va = (uint)addr + i;
+
+        // Get the PTE
+        pte = walkpgdir(pgdir, (void *)va, 0);
+        if (pte == 0)
+            panic("loaduvm: address should exist");
+
+        // Get the physical address
+        pa = PTE_ADDR(*pte);
+
+        // Read from the inode into physical memory
+        n = min(PGSIZE, sz - i);
+        if (readi(ip, P2V(pa), offset + i, n) != n)
+            return -1;
+
+        // **Set the page permissions based on the ELF segment flags**
+        // Clear existing permission bits
+        *pte &= ~PTE_W;
+
+        // If the segment is writable, set PTE_W
+        if (flags & ELF_PROG_FLAG_WRITE)
+            *pte |= PTE_W;
+    }
+    return 0;
 }
 
 // Allocate page tables and physical memory to grow process from oldsz to
@@ -277,25 +294,62 @@ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
   }
   return newsz;
 }
+void
+freevm_pgdir(pde_t *pgdir)
+{
+    uint i;
+
+    for(i = 0; i < NPDENTRIES; i++){
+        if(pgdir[i] & PTE_P){
+            char * v = P2V(PTE_ADDR(pgdir[i]));
+            kfree(v);
+        }
+    }
+    kfree((char*)pgdir);
+}
 
 // Free a page table and all the physical memory pages
 // in the user part.
 void
 freevm(pde_t *pgdir)
 {
-  uint i;
+    uint i;
 
-  if(pgdir == 0)
-    panic("freevm: no pgdir");
-  deallocuvm(pgdir, KERNBASE, 0);
-  for(i = 0; i < NPDENTRIES; i++){
-    if(pgdir[i] & PTE_P){
-      char * v = P2V(PTE_ADDR(pgdir[i]));
-      kfree(v);
+    if(pgdir == 0)
+        panic("freevm: no pgdir");
+
+    // Deallocate pages from mappings first
+    struct proc *p = myproc();
+    for (i = 0; i < p->num_mappings; i++) {
+        struct mapping *m = &p->mappings[i];
+        uint addr = m->addr;
+        uint length = m->length;
+        for (uint va = addr; va < addr + length; va += PGSIZE) {
+            pte_t *pte = walkpgdir(pgdir, (char *)va, 0);
+            if (pte && (*pte & PTE_P)) {
+                if (m->flags & MAP_SHARED) {
+                    // Do not free shared pages here
+                    // We'll handle them in wunmap or when all processes exit
+                    *pte = 0; // Clear the PTE
+                } else {
+                    // Free private mapping pages
+                    uint pa = PTE_ADDR(*pte);
+                    char *v = P2V(pa);
+                    kfree(v);
+                    *pte = 0; // Clear the PTE
+                }
+            }
+        }
     }
-  }
-  kfree((char*)pgdir);
+
+    // Deallocate pages for the rest of the process
+    deallocuvm(pgdir, p->sz, 0);
+
+    // Free the page directory
+    freevm_pgdir(pgdir);
 }
+
+
 
 // Clear PTE_U on a page. Used to create an inaccessible
 // page beneath the user stack.
@@ -315,34 +369,36 @@ clearpteu(pde_t *pgdir, char *uva)
 pde_t*
 copyuvm(pde_t *pgdir, uint sz)
 {
-  pde_t *d;
-  pte_t *pte;
-  uint pa, i, flags;
-  char *mem;
+    pde_t *d;
+    pte_t *pte;
+    uint pa, i, flags;
+    char *mem;
 
-  if((d = setupkvm()) == 0)
-    return 0;
-  for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
-      panic("copyuvm: pte should exist");
-    if(!(*pte & PTE_P))
-      panic("copyuvm: page not present");
-    pa = PTE_ADDR(*pte);
-    flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto bad;
-    memmove(mem, (char*)P2V(pa), PGSIZE);
-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
-      kfree(mem);
-      goto bad;
+    if((d = setupkvm()) == 0)
+        return 0;
+
+    for(i = 0; i < sz; i += PGSIZE){
+        if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
+            continue; // Skip if PTE does not exist
+        if(!(*pte & PTE_P))
+            continue; // Skip if page is not present
+        pa = PTE_ADDR(*pte);
+        flags = PTE_FLAGS(*pte);
+        if((mem = kalloc()) == 0)
+            goto bad;
+        memmove(mem, (char*)P2V(pa), PGSIZE);
+        if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
+            kfree(mem);
+            goto bad;
+        }
     }
-  }
-  return d;
+    return d;
 
 bad:
-  freevm(d);
-  return 0;
+    freevm(d);
+    return 0;
 }
+
 
 //PAGEBREAK!
 // Map user virtual address to kernel address.
@@ -384,11 +440,241 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
   }
   return 0;
 }
+// Translates a user virtual address to a physical address.
+uint va2pa(uint va) {
+    struct proc *p = myproc();
+    pte_t *pte;
+    uint pa;
 
-//PAGEBREAK!
-// Blank page.
-//PAGEBREAK!
-// Blank page.
-//PAGEBREAK!
-// Blank page.
+    pte = walkpgdir(p->pgdir, (char*)va, 0);
+    if(pte == 0)
+        return (uint)-1;
+    if((*pte & PTE_P) == 0)
+        return (uint)-1;
+    pa = PTE_ADDR(*pte) | (va & 0xFFF);
+    return pa;
+}
 
+// Implement getwmapinfo
+int getwmapinfo(struct wmapinfo *info) {
+    struct proc *p = myproc();
+
+    if(!p || !info)
+        return FAILED;
+
+    info->total_mmaps = p->num_mappings;
+    for(int i = 0; i < p->num_mappings && i < MAX_WMMAP_INFO; i++) {
+        info->addr[i] = p->mappings[i].addr;
+        info->length[i] = p->mappings[i].length;
+        info->n_loaded_pages[i] = p->mappings[i].n_loaded_pages;
+    }
+
+    return SUCCESS;
+}
+
+// Implement wmap
+int wmap(uint addr, int length, int flags, int fd) {
+    struct proc *p = myproc();
+
+    // Essential debug statement
+    cprintf("wmap: Entering with addr=0x%x, length=%d, flags=0x%x, fd=%d\n", addr, length, flags, fd);
+
+    // 1. Validate Flags: MAP_FIXED and MAP_SHARED must be set
+    if ((flags & MAP_FIXED) == 0) {
+        cprintf("wmap ERROR: MAP_FIXED must be present in flags\n");
+        return FAILED;
+    }
+    if ((flags & MAP_SHARED) == 0) {
+        cprintf("wmap ERROR: MAP_SHARED must be present in flags\n");
+        return FAILED;
+    }
+
+    // 2. Validate Address Range: Must be within user space (0x60000000 - 0x80000000)
+    if (addr < 0x60000000 || addr >= 0x80000000) {
+        cprintf("wmap ERROR: addr=0x%x not in user space\n", addr);
+        return FAILED;
+    }
+
+    // 3. Validate Address Alignment: Must be page-aligned
+    if (addr % PGSIZE != 0) {
+        cprintf("wmap ERROR: addr=0x%x is not page-aligned\n", addr);
+        return FAILED;
+    }
+
+    // 4. Validate Length: Must be greater than 0
+    if (length <= 0) {
+        cprintf("wmap ERROR: invalid length=%d\n", length);
+        return FAILED;
+    }
+
+    // 5. Check if Maximum Number of Mappings is Reached
+    if (p->num_mappings >= MAX_MAPPINGS) {
+        cprintf("wmap ERROR: maximum number of mappings (%d) reached.\n", MAX_MAPPINGS);
+        return FAILED;
+    }
+
+    // 6. Check for Overlapping Mappings
+    for (int i = 0; i < p->num_mappings; i++) {
+        uint start = p->mappings[i].addr;
+        uint end = start + p->mappings[i].length;
+        if (addr < end && (addr + length) > start) {
+            cprintf("wmap ERROR: overlapping with existing mapping %d (0x%x - 0x%x).\n", 
+                    i + 1, start, end);
+            return FAILED; // Overlapping with existing mapping
+        }
+    }
+
+    // 7. Handle MAP_ANONYMOUS Flag
+    if (flags & MAP_ANONYMOUS) {
+        // For anonymous mappings, ignore the passed fd and set it to -1 internally
+        cprintf("wmap: Handling anonymous mapping. Ignoring passed fd=%d and setting fd to -1.\n", fd);
+        fd = -1; // Treat as anonymous mapping regardless of passed fd
+    } else {
+        // For file-backed mappings, validate the file descriptor
+        if (fd < 0 || fd >= NOFILE || p->ofile[fd] == 0) {
+            cprintf("wmap ERROR: invalid file descriptor %d.\n", fd);
+            return FAILED;
+        }
+        struct file *f = p->ofile[fd];
+        if (f->type != FD_INODE) {
+            cprintf("wmap ERROR: file descriptor %d is not FD_INODE.\n", fd);
+            return FAILED;
+        }
+        filedup(f); // Increment the file reference count
+        cprintf("wmap: Handling file-backed mapping with fd=%d.\n", fd);
+    }
+
+    // 8. Record the Mapping
+    struct mapping *m = &p->mappings[p->num_mappings++];
+    m->addr = addr;
+    m->length = length;
+    m->flags = flags;
+    if (flags & MAP_ANONYMOUS) {
+        m->fd = -1;    // No file descriptor for anonymous mappings
+        m->file = 0;   // No file pointer
+    } else {
+        m->fd = fd;               // Assign the file descriptor
+        m->file = p->ofile[fd];  // Assign the file pointer
+    }
+    m->n_loaded_pages = 0;
+
+    cprintf("wmap: Successfully recorded mapping %d at addr=0x%x with length=%d bytes.\n", 
+            p->num_mappings, addr, length);
+
+    // 9. Set Up PTEs with present=0 for the Mapped Region (Lazy Allocation)
+    uint end_addr = PGROUNDUP(addr + length);
+    for (uint va = addr; va < end_addr; va += PGSIZE) {
+        pte_t *pte = walkpgdir(p->pgdir, (const void*)va, 1); // Create page table entry if not present
+        if (pte == 0) {
+            cprintf("wmap ERROR: walkpgdir failed for va=0x%x\n", va);
+            return FAILED;
+        }
+        // Set PTE to present=0, writable, user-accessible
+        *pte = PTE_U | PTE_W; // PTE_P (present) is not set
+        // Minimal logging to avoid timeouts
+        if (va == addr) { // Log only the first PTE setup for brevity
+            cprintf("wmap: Set PTE for va=0x%x to PTE_U | PTE_W (present=0).\n", va);
+        }
+    }
+
+    // 10. Return the Starting Address of the Mapping
+    return addr; // Return the starting address of the mapping
+}
+// Implement wunmap
+int wunmap(uint addr) {
+    struct proc *p = myproc();
+    int index = -1;
+
+    // Find the mapping corresponding to the provided address
+    for (int i = 0; i < p->num_mappings; i++) {
+        if (p->mappings[i].addr == addr) {
+            index = i;
+            break;
+        }
+    }
+
+    if (index == -1) {
+        cprintf("wunmap ERROR: No mapping found at address 0x%x\n", addr);
+        return -1;
+    }
+
+    struct mapping *m = &p->mappings[index];
+
+    // Check if the mapping is file-backed
+    if (m->fd >= 0 && (m->flags & MAP_SHARED)) {
+        // File-backed mapping
+
+        struct file *f = m->file;
+        if (f == 0 || f->type != FD_INODE) {
+            cprintf("wunmap ERROR: Invalid file for mapping at 0x%x\n", addr);
+            return -1;
+        }
+
+        uint map_start = m->addr;
+        uint map_end = map_start + m->length;
+        for (uint va = map_start; va < map_end; va += PGSIZE) {
+            pte_t *pte = walkpgdir(p->pgdir, (void *)va, 0);
+            if (pte && (*pte & PTE_P)) {
+                // Begin a transaction for this page
+                begin_op();
+
+                // Get the physical address
+                uint pa = PTE_ADDR(*pte);
+
+                // Convert physical address to kernel virtual address
+                char *vpa = P2V(pa);
+
+                // Calculate the file offset
+                uint file_offset = va - map_start;
+
+                // Write the page back to the file
+                if (writei(f->ip, vpa, file_offset, PGSIZE) != PGSIZE) {
+                    cprintf("wunmap ERROR: Failed to write page at va=0x%x to file\n", va);
+                    end_op(); // End the transaction before returning
+                    return -1;
+                }
+
+                // End the transaction
+                end_op();
+
+                // Clear the PTE
+                *pte = 0;
+            }
+        }
+
+        // Close the file
+        fileclose(f);
+    } else {
+        // Anonymous mapping
+
+        uint map_start = m->addr;
+        uint map_end = map_start + m->length;
+        for (uint va = map_start; va < map_end; va += PGSIZE) {
+            pte_t *pte = walkpgdir(p->pgdir, (void *)va, 0);
+            if (pte && (*pte & PTE_P)) {
+                // Get the physical address
+                uint pa = PTE_ADDR(*pte);
+
+                if (m->flags & MAP_SHARED) {
+                    // For shared anonymous mappings, do not free the physical page
+                    // Just clear the PTE to unmap it from this process
+                    // Leave the physical page intact
+                } else {
+                    // For private mappings, free the physical page
+                    kfree(P2V(pa));
+                }
+
+                // Clear the PTE
+                *pte = 0;
+            }
+        }
+    }
+
+    // Remove the mapping from the process's mapping list
+    for (int i = index; i < p->num_mappings - 1; i++) {
+        p->mappings[i] = p->mappings[i + 1];
+    }
+    p->num_mappings--;
+
+    return 0; // Success
+}

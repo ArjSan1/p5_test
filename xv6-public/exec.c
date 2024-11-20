@@ -8,6 +8,27 @@
 #include "elf.h"
 
 int
+adjust_pte_flags(pde_t *pgdir, uint va_start, uint memsz, int flags)
+{
+    uint va_end = va_start + memsz;
+    uint va;
+    pte_t *pte;
+
+    for(va = PGROUNDDOWN(va_start); va < va_end; va += PGSIZE) {
+        pte = walkpgdir(pgdir, (char *)va, 0);
+        if(pte == 0)
+            return -1;
+        // Clear PTE_W (writable) bit
+        *pte &= ~PTE_W;
+        // Set PTE_W if the segment is writable
+        if(flags & ELF_PROG_FLAG_WRITE)
+            *pte |= PTE_W;
+    }
+    return 0;
+}
+
+
+int
 exec(char *path, char **argv)
 {
   char *s, *last;
@@ -40,7 +61,7 @@ exec(char *path, char **argv)
 
   // Load program into memory.
   sz = 0;
-  for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
+for(i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)){
     if(readi(ip, (char*)&ph, off, sizeof(ph)) != sizeof(ph))
       goto bad;
     if(ph.type != ELF_PROG_LOAD)
@@ -53,9 +74,12 @@ exec(char *path, char **argv)
       goto bad;
     if(ph.vaddr % PGSIZE != 0)
       goto bad;
-    if(loaduvm(pgdir, (char*)ph.vaddr, ip, ph.off, ph.filesz) < 0)
+    if(loaduvm(pgdir, (char*)ph.vaddr, ip, ph.off, ph.filesz, ph.flags) < 0)
       goto bad;
-  }
+    // Adjust page table entries based on segment flags
+    if(adjust_pte_flags(pgdir, ph.vaddr, ph.memsz, ph.flags) < 0)
+      goto bad;
+}
   iunlockput(ip);
   end_op();
   ip = 0;

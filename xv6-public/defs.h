@@ -1,3 +1,9 @@
+#ifndef _DEFS_H_
+#define _DEFS_H_
+
+#include "wmap.h"
+#include "mmu.h"
+
 struct buf;
 struct context;
 struct file;
@@ -23,6 +29,7 @@ void            consoleintr(int(*)(void));
 void            panic(char*) __attribute__((noreturn));
 
 // exec.c
+int adjust_pte_flags(pde_t *pgdir, uint va_start, uint memsz, int flags);
 int             exec(char*, char**);
 
 // file.c
@@ -175,16 +182,25 @@ void            seginit(void);
 void            kvmalloc(void);
 pde_t*          setupkvm(void);
 char*           uva2ka(pde_t*, char*);
-int             allocuvm(pde_t*, uint, uint);
+int             allocuvm(pde_t *pgdir, uint oldsz, uint newsz);
 int             deallocuvm(pde_t*, uint, uint);
 void            freevm(pde_t*);
 void            inituvm(pde_t*, char*, uint);
-int             loaduvm(pde_t*, char*, struct inode*, uint, uint);
+int             loaduvm(pde_t*, char*, struct inode*, uint, uint, int);
 pde_t*          copyuvm(pde_t*, uint);
 void            switchuvm(struct proc*);
 void            switchkvm(void);
 int             copyout(pde_t*, uint, void*, uint);
 void            clearpteu(pde_t *pgdir, char *uva);
+pte_t*          walkpgdir(pde_t *pgdir, const void *va, int alloc);
+int             mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm);
+uint            va2pa(uint va);
+int             getwmapinfo(struct wmapinfo *info);
+int             wmap(uint addr, int length, int flags, int fd);
+int             wunmap(uint addr);
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+
+
+#endif // _DEFS_H_

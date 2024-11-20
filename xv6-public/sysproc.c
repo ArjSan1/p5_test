@@ -7,6 +7,7 @@
 #include "mmu.h"
 #include "proc.h"
 
+
 int
 sys_fork(void)
 {
@@ -88,4 +89,57 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+
+int
+sys_va2pa(void)
+{
+    uint va;
+    if(argint(0, (int*)&va) < 0)
+        return FAILED;
+    uint pa = va2pa(va);
+    if(pa == (uint)-1)
+        return FAILED;
+    return pa;
+}
+
+int
+sys_getwmapinfo(void)
+{
+    struct wmapinfo *wminfo;
+    if(argptr(0, (char**)&wminfo, sizeof(*wminfo)) < 0)
+        return FAILED;
+
+    return getwmapinfo(wminfo);
+}
+
+int
+sys_wmap(void)
+{
+    uint addr;
+    int length;
+    int flags;
+    int fd;
+
+    if(argint(0, (int*)&addr) < 0)
+        return FAILED;
+    if(argint(1, &length) < 0)
+        return FAILED;
+    if(argint(2, &flags) < 0)
+        return FAILED;
+    if(argint(3, &fd) < 0)
+        return FAILED;
+
+    return wmap(addr, length, flags, fd);
+}
+
+int
+sys_wunmap(void)
+{
+    uint addr;
+    if(argint(0, (int*)&addr) < 0)
+        return FAILED;
+
+    return wunmap(addr);
 }

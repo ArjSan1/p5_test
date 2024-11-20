@@ -78,6 +78,7 @@ allocproc(void)
 
   acquire(&ptable.lock);
 
+
   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
     if(p->state == UNUSED)
       goto found;
@@ -88,7 +89,7 @@ allocproc(void)
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
-
+  p->num_mappings = 0; // Initialize number of mappings
   release(&ptable.lock);
 
   // Allocate kernel stack.
@@ -173,98 +174,171 @@ growproc(int n)
   switchuvm(curproc);
   return 0;
 }
+int
+update_child_pagetable(struct proc *parent, struct proc *child)
+{
+    int i;
+    uint addr, length;
+    pte_t *pte_parent;
+
+    for (i = 0; i < parent->num_mappings; i++) {
+        struct mapping *m = &parent->mappings[i];
+        addr = m->addr;
+        length = m->length;
+
+        for (uint va = addr; va < addr + length; va += PGSIZE) {
+            // Get parent PTE
+            pte_parent = walkpgdir(parent->pgdir, (void *)va, 0);
+            if (!pte_parent || !(*pte_parent & PTE_P)) {
+                continue; // Skip if page not present
+            }
+
+            uint pa = PTE_ADDR(*pte_parent);
+            uint flags = PTE_FLAGS(*pte_parent);
+
+            // Check if mapping is MAP_SHARED
+            if (m->flags & MAP_SHARED) {
+                // Map the same physical page into the child's page table
+                if (mappages(child->pgdir, (void *)va, PGSIZE, pa, flags) < 0) {
+                    cprintf("update_child_pagetable: mappages failed\n");
+                    return -1;
+                }
+            } else {
+                // For MAP_PRIVATE, copy the page
+                char *mem;
+                if ((mem = kalloc()) == 0) {
+                    cprintf("update_child_pagetable: kalloc failed\n");
+                    return -1;
+                }
+                memmove(mem, (char *)P2V(pa), PGSIZE);
+                if (mappages(child->pgdir, (void *)va, PGSIZE, V2P(mem), flags) < 0) {
+                    kfree(mem);
+                    cprintf("update_child_pagetable: mappages failed\n");
+                    return -1;
+                }
+            }
+        }
+    }
+    return 0; // Success
+}
+
 
 // Create a new process copying p as the parent.
 // Sets up stack to return as if from system call.
-// Caller must set state of returned proc to RUNNABLE.
+// Caller must set state of returned proc  to RUNNABLE.
 int
 fork(void)
 {
-  int i, pid;
-  struct proc *np;
-  struct proc *curproc = myproc();
+    int i, pid;
+    struct proc *np;
+    struct proc *curproc = myproc();
 
-  // Allocate process.
-  if((np = allocproc()) == 0){
-    return -1;
-  }
+    // Allocate process.
+    if((np = allocproc()) == 0){
+        return -1;
+    }
 
-  // Copy process state from proc.
-  if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0){
-    kfree(np->kstack);
-    np->kstack = 0;
-    np->state = UNUSED;
-    return -1;
-  }
-  np->sz = curproc->sz;
-  np->parent = curproc;
-  *np->tf = *curproc->tf;
+    // Copy process state from curproc.
+    if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0){
+        kfree(np->kstack);
+        np->kstack = 0;
+        np->state = UNUSED;
+        return -1;
+    }
+    np->sz = curproc->sz;
+    np->parent = curproc;
+    *np->tf = *curproc->tf;
 
-  // Clear %eax so that fork returns 0 in the child.
-  np->tf->eax = 0;
+    // Clear %eax so that fork returns 0 in the child.
+    np->tf->eax = 0;
 
-  for(i = 0; i < NOFILE; i++)
-    if(curproc->ofile[i])
-      np->ofile[i] = filedup(curproc->ofile[i]);
-  np->cwd = idup(curproc->cwd);
+    // Copy file descriptors
+    for(i = 0; i < NOFILE; i++)
+        if(curproc->ofile[i])
+            np->ofile[i] = filedup(curproc->ofile[i]);
+    np->cwd = idup(curproc->cwd);
 
-  safestrcpy(np->name, curproc->name, sizeof(curproc->name));
+    // Copy memory mappings
+    np->num_mappings = curproc->num_mappings;
+    for (i = 0; i < curproc->num_mappings; i++) {
+        np->mappings[i] = curproc->mappings[i];
+        // Duplicate file if it's a file-backed mapping
+        if (np->mappings[i].file) {
+            np->mappings[i].file = filedup(np->mappings[i].file);
+        }
+    }
 
-  pid = np->pid;
+    // Update the child's page tables for the mappings
+    if (update_child_pagetable(curproc, np) < 0) {
+        // Handle failure
+        kfree(np->kstack);
+        np->kstack = 0;
+        freevm(np->pgdir);
+        np->state = UNUSED;
+        return -1;
+    }
 
-  acquire(&ptable.lock);
+    safestrcpy(np->name, curproc->name, sizeof(curproc->name));
 
-  np->state = RUNNABLE;
+    pid = np->pid;
 
-  release(&ptable.lock);
+    // Commit to the user image.
+    acquire(&ptable.lock);
+    np->state = RUNNABLE;
+    release(&ptable.lock);
 
-  return pid;
+    return pid;
 }
 
 // Exit the current process.  Does not return.
 // An exited process remains in the zombie state
 // until its parent calls wait() to find out it exited.
-void
-exit(void)
-{
-  struct proc *curproc = myproc();
-  struct proc *p;
-  int fd;
+void exit(void) {
+    struct proc *curproc = myproc();
+    struct proc *p;
+    int fd;
 
-  if(curproc == initproc)
-    panic("init exiting");
+    if(curproc == initproc)
+        panic("init exiting");
 
-  // Close all open files.
-  for(fd = 0; fd < NOFILE; fd++){
-    if(curproc->ofile[fd]){
-      fileclose(curproc->ofile[fd]);
-      curproc->ofile[fd] = 0;
+    // Close all open files.
+    for(fd = 0; fd < NOFILE; fd++){
+        if(curproc->ofile[fd]){
+            fileclose(curproc->ofile[fd]);
+            curproc->ofile[fd] = 0;
+        }
     }
-  }
 
-  begin_op();
-  iput(curproc->cwd);
-  end_op();
-  curproc->cwd = 0;
+    // Clean up memory mappings
+    for (int i = 0; i < curproc->num_mappings; i++) {
+        struct mapping *m = &curproc->mappings[i];
+        // Unmap the pages
+        wunmap(m->addr);
 
-  acquire(&ptable.lock);
-
-  // Parent might be sleeping in wait().
-  wakeup1(curproc->parent);
-
-  // Pass abandoned children to init.
-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-    if(p->parent == curproc){
-      p->parent = initproc;
-      if(p->state == ZOMBIE)
-        wakeup1(initproc);
+        // Do not close the file again here
+        // m->file = 0; // Already handled in wunmap
     }
-  }
+    curproc->num_mappings = 0;
 
-  // Jump into the scheduler, never to return.
-  curproc->state = ZOMBIE;
-  sched();
-  panic("zombie exit");
+    // Reassign orphaned child processes to initproc
+    acquire(&ptable.lock);
+
+    // Parent might be sleeping in wait().
+    wakeup1(curproc->parent);
+
+    // Pass abandoned children to init.
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+        if(p->parent == curproc){
+            p->parent = initproc;
+            if(p->state == ZOMBIE)
+                wakeup1(initproc);
+        }
+    }
+
+    // Jump into the scheduler, never to return.
+    curproc->state = ZOMBIE;
+    sched();
+    panic("zombie exit");
 }
 
 // Wait for a child process to exit and return its pid.
